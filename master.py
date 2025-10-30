@@ -1,23 +1,29 @@
-from flask import Flask, request, jsonify, render_template_string
 import os
-from datetime import datetime
 import sys
 import json
+import threading
+import time
+from datetime import datetime
+import tkinter as tk
+from tkinter import ttk, messagebox
 from PIL import Image, ImageDraw
 import pystray
 from pystray import MenuItem, Icon
-import waitress
-import threading
 from logger import log_status, read_log
 
+# --------------------------------------------------------
+# CONFIGURAÇÃO INICIAL
+# --------------------------------------------------------
 if getattr(sys, 'frozen', False):
     base_path = os.path.dirname(sys.executable)
 else:
     base_path = os.path.dirname(os.path.abspath(__file__))
 
 CONFIG_FILE = os.path.join(base_path, "config.json")
+OFFLINE_TIMEOUT = 20  # segundos
 
-def load_config():
+def create_default_config():
+    """Cria um config.json padrão se não existir."""
     if not os.path.exists(CONFIG_FILE):
         default_config = {
             "connections": [
@@ -36,184 +42,178 @@ def load_config():
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(default_config, f, ensure_ascii=False, indent=4)
 
+def load_config():
+    """Carrega o config.json."""
+    if not os.path.exists(CONFIG_FILE):
+        create_default_config()
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
-config = load_config()
-connections = config.get('connections', [])
-ip_to_nome = {conn['ip']: conn.get('nome_da_conexao', conn['ip']) for conn in connections}
-ip_to_processos = {conn['ip']: conn.get('processos', []) for conn in connections}
-FIXED_IPS = list(ip_to_nome.keys())
+def save_config(config_data):
+    """Salva o config.json."""
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config_data, f, ensure_ascii=False, indent=4)
+    messagebox.showinfo("Configuração", "Configurações salvas com sucesso!")
 
+# --------------------------------------------------------
+# DADOS DE MONITORAMENTO
+# --------------------------------------------------------
 status_dict = {}
-OFFLINE_TIMEOUT = 20  # segundos
 
-app = Flask(__name__)
+def update_status(ip, process, status):
+    """Atualiza o status manualmente (simula recebimento de agentes)."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    status_dict[ip] = {"process": process, "status": status, "timestamp": timestamp}
+    log_status(ip, ip, process, status, timestamp)
 
-@app.route('/status', methods=['POST'])
-def receive_status():
-    data = request.get_json()
-    process = data.get("process")
-    status = data.get("status")
-    ip = request.remote_addr
+# --------------------------------------------------------
+# INTERFACE TKINTER
+# --------------------------------------------------------
+def abrir_painel():
+    """Abre o painel principal de monitoramento."""
+    janela = tk.Tk()
+    janela.title("Painel de Monitoramento")
+    janela.geometry("700x500")
+    janela.resizable(False, False)
 
-    if not process or not status:
-        return jsonify({"error": "Dados incompletos"}), 400
+    tk.Label(janela, text="Status dos Processos", font=("Arial", 14, "bold")).pack(pady=10)
 
-    if ip not in FIXED_IPS:
-        return jsonify({"error": "IP não autorizado"}), 403
+    tree = ttk.Treeview(janela, columns=("ip", "nome", "processo", "status", "timestamp"), show="headings", height=12)
+    for col in ("ip", "nome", "processo", "status", "timestamp"):
+        tree.heading(col, text=col.capitalize())
+        tree.column(col, width=130 if col != "timestamp" else 160)
+    tree.pack(pady=5)
 
-    allowed_processes_lower = [p.lower() for p in ip_to_processos.get(ip, [])]
-    if process.lower() not in allowed_processes_lower:
-        return jsonify({"error": f"Processo '{process}' não autorizado para o IP {ip}"}), 403
+    def atualizar():
+        tree.delete(*tree.get_children())
+        now = datetime.now()
+        config = load_config()
+        for conn in config["connections"]:
+            ip = conn["ip"]
+            nome = conn["nome_da_conexao"]
+            processos = conn["processos"]
+            entry = status_dict.get(ip, None)
+            if entry:
+                try:
+                    last_update = datetime.strptime(entry["timestamp"], "%Y-%m-%d %H:%M:%S")
+                except:
+                    last_update = datetime.fromtimestamp(0)
+                offline = (now - last_update).total_seconds() > OFFLINE_TIMEOUT
+                status_text = "OFFLINE" if offline else entry["status"]
+                tree.insert("", "end", values=(ip, nome, entry["process"], status_text, entry["timestamp"]))
+            else:
+                tree.insert("", "end", values=(ip, nome, ", ".join(processos), "OFFLINE", "-"))
+        janela.after(5000, atualizar)
 
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    atualizar()
 
-    status_dict[ip] = {
-        "process": process.upper(),
-        "status": status.upper(),
-        "timestamp": timestamp,
-    }
+    def abrir_logs():
+        logs = read_log()
+        log_janela = tk.Toplevel(janela)
+        log_janela.title("Logs do Sistema")
+        log_janela.geometry("600x400")
+        text = tk.Text(log_janela, wrap="word", font=("Consolas", 10))
+        text.pack(expand=True, fill="both")
+        for line in logs:
+            text.insert("end", json.dumps(line, ensure_ascii=False) + "\n")
 
-    log_status(ip, ip_to_nome.get(ip, ip), process.upper(), status.upper(), timestamp)
-    print(f"[RECEBIDO] {timestamp} - {ip} | {process.upper()} está {status.upper()}")
-    return jsonify({"message": "Status recebido com sucesso"}), 200
+    tk.Button(janela, text="Ver Logs", command=abrir_logs, width=20, height=2).pack(pady=10)
+    tk.Button(janela, text="Fechar", command=janela.destroy, width=20, height=2).pack(pady=5)
+    janela.mainloop()
 
-@app.route('/status/all')
-def status_all():
-    now = datetime.now()
-    result = {}
+def abrir_configuracao():
+    """Abre a janela de configuração para editar o config.json."""
+    config = load_config()
+    janela = tk.Tk()
+    janela.title("Configuração de Conexões")
+    janela.geometry("600x500")
+    janela.resizable(False, False)
 
-    for ip in FIXED_IPS:
-        entry = status_dict.get(ip)
-        if entry:
-            try:
-                last_update = datetime.strptime(entry['timestamp'], '%Y-%m-%d %H:%M:%S')
-            except:
-                last_update = datetime.fromtimestamp(0)
+    tk.Label(janela, text="Gerenciar Conexões", font=("Arial", 14, "bold")).pack(pady=10)
 
-            offline = (now - last_update).total_seconds() > OFFLINE_TIMEOUT
-            
-            status_value = entry['status']
-            if offline:
-                status_value = "OFFLINE"
+    tree = ttk.Treeview(janela, columns=("ip", "nome", "processos"), show="headings", height=10)
+    for col in ("ip", "nome", "processos"):
+        tree.heading(col, text=col.capitalize())
+        tree.column(col, width=180 if col != "processos" else 220)
+    tree.pack(pady=5)
 
-            result[ip] = {
-                "process": entry["process"],
-                "status": status_value,
-                "timestamp": entry["timestamp"],
-                "offline": offline
-            }
-        else:
-            result[ip] = {
-                "process": "Desconhecido",
-                "status": "OFFLINE",
-                "timestamp": "-",
-                "offline": True
-            }
+    def carregar_lista():
+        tree.delete(*tree.get_children())
+        for conn in config["connections"]:
+            tree.insert("", "end", values=(conn["ip"], conn["nome_da_conexao"], ", ".join(conn["processos"])))
 
-    return jsonify(result)
+    carregar_lista()
 
-@app.route('/log')
-def view_log():
-    logs = read_log()
-    return jsonify(logs)
+    ip_var = tk.StringVar()
+    nome_var = tk.StringVar()
+    proc_var = tk.StringVar()
 
-def format_log_with_colors(log_entry):
-    parts = []
-    for key, value in log_entry.items():
-        color = ""
-        if key.lower() == "ip":
-            color = "blue"
-        elif key.lower() == "status":
-            color = "red" if str(value).upper() == "OFFLINE" else "green"
-        elif key.lower() == "process":
-            color = "purple"
-        elif key.lower() == "timestamp":
-            color = "gray"
-        else:
-            color = "black"
-        parts.append(f'<span style="color: {color};"><strong>{key}:</strong> {value}</span>')
-    return " | ".join(parts)
+    form = tk.Frame(janela)
+    form.pack(pady=10)
 
-@app.route('/')
-def homepage():
-    status_data = status_all().get_json()
-    log_lines = read_log()
-    log_content = [format_log_with_colors(line) for line in log_lines]
+    tk.Label(form, text="IP:").grid(row=0, column=0)
+    tk.Entry(form, textvariable=ip_var, width=20).grid(row=0, column=1)
 
-    return render_template_string('''
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Monitor de Processos</title>
-    <style>
-        body { font-family: 'Arial', sans-serif; padding: 24px; background-color: #f4f4f9; }
-        h1 { color: #2563eb; }
-        table { width: 100%; max-width: 960px; border-collapse: collapse; background: #fff; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
-        th, td { padding: 12px 16px; border-bottom: 1px solid #ccc; }
-        thead { background-color: #2563eb; color: white; }
-        .status-online { color: green; font-weight: bold; }
-        .status-offline { color: red; font-weight: bold; }
-        .log-container { margin-top: 24px; max-width: 960px; background: white; padding: 16px; border-radius: 8px;
-            font-family: monospace; white-space: pre-wrap; max-height: 300px; overflow-y: auto; }
-    </style>
-</head>
-<body>
-    <h1>Monitor de Processos</h1>
-    <table>
-        <thead>
-            <tr>
-                <th>IP</th>
-                <th>Nome da Conexão</th>
-                <th>Processo</th>
-                <th>Status</th>
-                <th>Última Atualização</th>
-                <th>Offline</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for ip in ips %}
-            {% set entry = status_dict[ip] %}
-            <tr>
-                <td>{{ ip }}</td>
-                <td>{{ ip_to_nome.get(ip, ip) }}</td>
-                <td>{{ entry.process }}</td>
-                <td class="{{ 'status-offline' if entry.status == 'OFFLINE' else 'status-online' }}">{{ entry.status }}</td>
-                <td>{{ entry.timestamp }}</td>
-                <td class="{{ 'status-offline' if entry.offline else 'status-online' }}">{{ "Sim" if entry.offline else "Não" }}</td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
+    tk.Label(form, text="Nome:").grid(row=1, column=0)
+    tk.Entry(form, textvariable=nome_var, width=20).grid(row=1, column=1)
 
-    <div class="log-container">
-        <strong>Logs Recentes:</strong>
-        <pre>{{ log_content | join('<br>') | safe }}</pre>
-    </div>
-</body>
-</html>
-''', ips=FIXED_IPS, status_dict=status_data, log_content=log_content, ip_to_nome=ip_to_nome)
+    tk.Label(form, text="Processos (sep. por vírgula):").grid(row=2, column=0)
+    tk.Entry(form, textvariable=proc_var, width=40).grid(row=2, column=1)
 
-def run_flask():
-    waitress.serve(app, host='0.0.0.0', port=5000)
+    def adicionar():
+        new_conn = {
+            "ip": ip_var.get().strip(),
+            "nome_da_conexao": nome_var.get().strip(),
+            "processos": [p.strip() for p in proc_var.get().split(",") if p.strip()]
+        }
+        if new_conn["ip"] and new_conn["nome_da_conexao"]:
+            config["connections"].append(new_conn)
+            save_config(config)
+            carregar_lista()
+            ip_var.set("")
+            nome_var.set("")
+            proc_var.set("")
 
-def create_image(width, height):
-    image = Image.new('RGB', (width, height), color=(255, 255, 255))
+    def remover():
+        sel = tree.selection()
+        if not sel:
+            return
+        valores = tree.item(sel[0], "values")
+        ip = valores[0]
+        config["connections"] = [c for c in config["connections"] if c["ip"] != ip]
+        save_config(config)
+        carregar_lista()
+
+    tk.Button(janela, text="Adicionar", command=adicionar, width=15).pack(pady=5)
+    tk.Button(janela, text="Remover", command=remover, width=15).pack(pady=5)
+    tk.Button(janela, text="Salvar e Fechar", command=janela.destroy, width=20, height=2).pack(pady=10)
+
+    janela.mainloop()
+
+# --------------------------------------------------------
+# ÍCONE DE BANDEJA
+# --------------------------------------------------------
+def create_image():
+    image = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
     dc = ImageDraw.Draw(image)
-    dc.ellipse((0, 0, width, height), fill=(0, 0, 255))
+    dc.ellipse((0, 0, 64, 64), fill=(0, 122, 204))
     return image
 
 def on_quit(icon, item):
     icon.stop()
     sys.exit()
 
-def setup(icon):
-    icon.visible = True
+def setup_tray():
+    icon = Icon("monitor_servidor", create_image(), "Servidor de Monitoramento", menu=pystray.Menu(
+        MenuItem("Abrir Painel", lambda icon, item: threading.Thread(target=abrir_painel).start()),
+        MenuItem("Configurações", lambda icon, item: threading.Thread(target=abrir_configuracao).start()),
+        MenuItem("Sair", on_quit)
+    ))
+    icon.run()
 
-if __name__ == '__main__':
-    icon = Icon("monitor_processos", create_image(64, 64), "Monitor de Processos", menu=(MenuItem("Sair", on_quit),))
-    threading.Thread(target=run_flask, daemon=True).start()
-    icon.run(setup)
+# --------------------------------------------------------
+# EXECUÇÃO
+# --------------------------------------------------------
+if __name__ == "__main__":
+    create_default_config()
+    threading.Thread(target=setup_tray, daemon=False).start()
